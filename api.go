@@ -1,9 +1,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
-  "sort"
 
 	"github.com/gorilla/mux"
 )
@@ -12,28 +12,28 @@ type MinioInstance struct {
 	host      string
 	accessKey string
 	secretKey string
-	// The one below can be improved - on the initialization of API we can ask minio instances on the amount
-	// of files they have in buckets and use them as offsets here. The name should be changed in that case.
-	// Likewise, on init we can add fetch all from minio instances to fill the objectMap with existing objects.
-	filesPushedThisRuntime int
 }
 
 type API struct {
-	minioAccessor    MinioAccessor
+	minioAccessor  MinioAccessor
 	minioInstances []MinioInstance // slice of instances for sorting purposes (and keeping counter for sorting)
-	objectMap      map[string]MinioInstance
+	modulo         int64           // for simplified calculation we store the length of minioInstances
 }
 
 func InitAPI() API {
 	api := API{}
 	api.minioAccessor = InitMinioClient()
+	api.SetMinioData()
+	return api
+}
+
+func (api *API) SetMinioData() {
 	instancesInfo, err := api.minioAccessor.getMinioInstancesInfo()
 	if err != nil {
 		panic(err)
 	}
 	api.minioInstances = instancesInfo
-	api.objectMap = make(map[string]MinioInstance)
-	return api
+	api.modulo = int64(len(instancesInfo))
 }
 
 func (api *API) serve() {
@@ -60,33 +60,52 @@ func (api *API) handleObject(w http.ResponseWriter, r *http.Request) {
 func (api *API) handleObjectGet(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	objectId := vars["id"]
-	// get the instance from id and access it. If the instance is unavailable (important to learn how to determine this from error message) - return an error in response.
-	if minioInstance, ok := api.objectMap[objectId]; ok {
-		content, err := api.minioAccessor.getMinioInstanceObject(objectId, minioInstance)
-		if err != nil {
-			http.Error(w, "Error during fetching object from instance.", http.StatusInternalServerError)
-			return
+
+	if api.modulo == 0 {
+		// If modulo is equal to zero let's try to determine the instances again - there is a race condition
+		api.SetMinioData()
+		if api.modulo == 0 {
+			panic(errors.New("No Minio instances are identified."))
 		}
-		w.Write(content)
-	} else {
-		http.Error(w, fmt.Sprintf("Object with id %s not found on any of underlying instances.", objectId), http.StatusBadRequest)
 	}
+	index, err := api.moduloFromObjectId(objectId, api.modulo)
+	if err != nil {
+		http.Error(w, "Error during parsing objectId.", http.StatusBadRequest) // This might be controversial but I believe this is user's fault.
+		return
+	}
+	if index > api.modulo {
+		http.Error(w, fmt.Sprintf("Object with id %s not found on any of underlying instances.", objectId), http.StatusBadRequest)
+		return
+	}
+	minioInstance := api.minioInstances[index]
+	content, err := api.minioAccessor.getMinioInstanceObject(objectId, minioInstance)
+	if err != nil {
+		http.Error(w, "Error during fetching object from instance.", http.StatusInternalServerError)
+		return
+	}
+	w.Write(content)
 }
 
 func (api *API) handleObjectPost(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	objectId := vars["id"]
-	// if the objectId is already present in memory, return an error.
-	if _, ok := api.objectMap[objectId]; ok {
-		http.Error(w, fmt.Sprintf("Object with id %s is already saved to the storage, please consider using different id.", objectId), http.StatusBadRequest)
+
+	if api.modulo == 0 {
+		// If modulo is equal to zero let's try to determine the instances again - there is a race condition
+		api.SetMinioData()
+		if api.modulo == 0 {
+			panic(errors.New("No Minio instances are identified."))
+		}
+	}
+	index, err := api.moduloFromObjectId(objectId, api.modulo)
+	if err != nil {
+		http.Error(w, "Error during parsing objectId.", http.StatusBadRequest) // This might be controversial but I believe this is user's fault.
 		return
 	}
 
-	// choose one instance at random and assign the objectId to map of ids: instances.
-	instance := api.roundRobin()
-	api.objectMap[objectId] = instance
-
-	err := api.minioAccessor.sendContentToMinioInstance(objectId, instance, r.Body, int64(1024))
+	// choose one instance based on objectId and number of available instances and save object there
+	instance := api.minioInstances[index]
+	err = api.minioAccessor.sendContentToMinioInstance(objectId, instance, r.Body, r.ContentLength)
 	if err != nil {
 		http.Error(w, "Error during sending object to instance.", http.StatusInternalServerError)
 	}
@@ -94,12 +113,12 @@ func (api *API) handleObjectPost(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("Object saved successfully."))
 }
 
-// roundRobin returns the least commonly used instance for next POST request.
-// It sorts the instances by filesPushedThisRuntime and returns the one with lowest value.
-func (api *API) roundRobin() MinioInstance {
-	sort.Slice(api.minioInstances, func(i, j int) bool {
-		return api.minioInstances[i].filesPushedThisRuntime < api.minioInstances[j].filesPushedThisRuntime
-	})
-  api.minioInstances[0].filesPushedThisRuntime++ // bump the counter
-	return api.minioInstances[0]
+// Get the int64 interpretation of objectId (sum of all the bytes from objectId) and return modulo of that value.
+// The value of modulo operand is determined by the number of minio instances and passed to the function.
+func (api *API) moduloFromObjectId(objectId string, modulo int64) (int64, error) {
+	result := int64(0)
+	for _, objectIdRune := range objectId {
+		result += int64(objectIdRune)
+	}
+	return result % modulo, nil
 }

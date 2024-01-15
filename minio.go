@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"fmt"
+	"log"
 	"io"
 	"strings"
 
@@ -40,7 +40,33 @@ func (client *MinioAccessor) getMinioClientForInstance(instance MinioInstance) (
   return minioClient, nil
 }
 
-// What should happen for duplicated object ids?
+func (client *MinioAccessor) getMinioInstanceObject(objectName string, instance MinioInstance) ([]byte, error) {
+	ctx := context.Background()
+
+	// Initialize minio client object.
+  minioClient, err := client.getMinioClientForInstance(instance)
+  if err != nil {
+    return nil, err
+  }
+  // FIXME: if object doesn't exist on instance API returns Empty reply from server and server goes down
+	minioObject, err := minioClient.GetObject(ctx, BUCKET_NAME, objectName, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, err
+	}
+  defer minioObject.Close()
+  // Pass the file content in batches onto the response.
+  response := []byte{}
+  for {
+    fileBody := make([]byte, BATCH_SIZE)
+    _, err = minioObject.Read(fileBody)
+    response = append(response, fileBody...)
+    if err == io.EOF {
+      break // break after the append as any byte slice smaller than BATCH_SIZE returns the io.EOF error.
+    }
+  }
+  return response, nil
+}
+
 func (client *MinioAccessor) sendContentToMinioInstance(objectName string, instance MinioInstance, reader io.Reader, objectSize int64) error {
 	ctx := context.Background()
 
@@ -55,21 +81,18 @@ func (client *MinioAccessor) sendContentToMinioInstance(objectName string, insta
 	if err != nil {
 		exists, errBucketExists := minioClient.BucketExists(ctx, BUCKET_NAME)
 		if errBucketExists == nil && exists {
-			fmt.Printf("Bucket exists: %s\n", BUCKET_NAME)
+			log.Printf("Bucket exists: %s\n", BUCKET_NAME)
 		} else {
 			return err
 		}
 	}
 
 	// upload the file with content from request
-	fileSize := -1 // FIXME: this should be the actual size of body. Maybe this is passed in request somewhere?
-	_, err = minioClient.PutObject(ctx, BUCKET_NAME, objectName, reader, int64(fileSize), minio.PutObjectOptions{})
+	_, err = minioClient.PutObject(ctx, BUCKET_NAME, objectName, reader, objectSize, minio.PutObjectOptions{})
 	if err != nil {
-		// if this is size mismatch we can live with this - the element is written to minio instance.
-		fmt.Println(err.Error())
+		return err
 	}
 	return nil
-	// TODO: consider verifying if the file was uploaded successfully
 }
 
 func (client *MinioAccessor) getMinioInstancesInfo() (instances []MinioInstance, err error) {
@@ -80,7 +103,7 @@ func (client *MinioAccessor) getMinioInstancesInfo() (instances []MinioInstance,
 	}
 	for _, container := range containers {
 		if container.Image != "minio/minio" {
-			fmt.Printf("Skipping container %s of image %s\n", container.ID, container.Image)
+			log.Printf("Skipping container %s of image %s\n", container.ID, container.Image)
 			continue
 		}
     instance, err := client.getMinioInstanceImportantSecrets(ctx, container.ID)
@@ -124,29 +147,4 @@ func (client *MinioAccessor) getMinioInstanceImportantSecrets(ctx context.Contex
 		}
 	}
 	return &secrets, nil
-}
-
-func (client *MinioAccessor) getMinioInstanceObject(objectName string, instance MinioInstance) ([]byte, error) {
-	ctx := context.Background()
-
-	// Initialize minio client object.
-  minioClient, err := client.getMinioClientForInstance(instance)
-  if err != nil {
-    return nil, err
-  }
-	minioObject, err := minioClient.GetObject(ctx, BUCKET_NAME, objectName, minio.GetObjectOptions{})
-	if err != nil {
-		return nil, err
-	}
-  // Pass the file content in batches onto the response.
-  response := []byte{}
-  for {
-    fileBody := make([]byte, BATCH_SIZE)
-    _, err = minioObject.Read(fileBody)
-    if err == io.EOF {
-      break
-    }
-    response = append(response, fileBody...)
-  }
-  return response, nil
 }
